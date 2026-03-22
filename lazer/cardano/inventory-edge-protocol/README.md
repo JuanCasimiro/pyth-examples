@@ -1,6 +1,6 @@
 # Inventory-Edge Protocol — Judge Briefing
 
-**Screenshots & UI pages (for judges):** [Google Doc — captures](https://docs.google.com/document/d/10R7zigvUrFPtYojwtqCrn2axnEarXEnd423Ktbk2eNo/edit?usp=sharing)
+**Screenshots & UI pages (for judges):** [Google Doc — captures](https://docs.google.com/document/d/10R7zigvUrFPtYojwtqCrn2axnEarXEnd423Ktbk2eNo/edit?usp=sharing) (the same link appears in the [repository root README](../../../README.md) so it shows on the GitHub repo / PR home view.)
 
 RealFi / RWA hackathon MVP: a **Cardano vault** that locks a demo NFT, tracks synthetic debt, supports **parametric insurance** (strike in datum), and uses **Pyth Lazer** (pull model) for **liquidation** and **insurance** checks.
 
