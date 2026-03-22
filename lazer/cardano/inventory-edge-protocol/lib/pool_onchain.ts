@@ -13,7 +13,7 @@ import type { UTxO } from "@evolution-sdk/evolution/UTxO";
 import { loadBlueprint, liquidityPoolSpendValidator } from "./blueprint.js";
 import { encodePoolDatum, redeemerPoolSpend } from "./datum_codec.js";
 import { createPreprodSigningClient } from "./evolution_client.js";
-import { newLucidPreprod } from "./mint_shadow.js";
+import { withLucidPreprod } from "./mint_shadow.js";
 import { decodePoolDatumOwnerHex } from "./pool_datum_decode.js";
 import { readInlineDatum } from "./transactions.js";
 import {
@@ -42,14 +42,15 @@ export function liquidityPoolAddressBech32(): string {
 
 export async function walletTotalLovelaceLucid(): Promise<bigint> {
   const mnemonic = requireEnv("CARDANO_MNEMONIC");
-  const lucid = await newLucidPreprod();
-  lucid.selectWalletFromSeed(mnemonic);
-  const utxos = await lucid.wallet.getUtxos();
-  let total = 0n;
-  for (const u of utxos) {
-    total += u.assets.lovelace;
-  }
-  return total;
+  return withLucidPreprod(async (lucid) => {
+    lucid.selectWalletFromSeed(mnemonic);
+    const utxos = await lucid.wallet.getUtxos();
+    let total = 0n;
+    for (const u of utxos) {
+      total += u.assets.lovelace;
+    }
+    return total;
+  });
 }
 
 export async function depositLiquidityPoolOnChain(params: {
@@ -59,41 +60,42 @@ export async function depositLiquidityPoolOnChain(params: {
     throw new Error("lovelace must be positive");
   }
   const mnemonic = requireEnv("CARDANO_MNEMONIC");
-  const lucid = await newLucidPreprod();
-  lucid.selectWalletFromSeed(mnemonic);
-  const userBech32 = await lucid.wallet.address();
-  const details = lucid.utils.getAddressDetails(userBech32);
-  if (details.paymentCredential?.type !== "Key") {
-    throw new Error("Expected key payment credential for pool datum owner");
-  }
-  const hashHex = details.paymentCredential.hash;
-  if (hashHex.length !== 56) {
-    throw new Error(`Unexpected payment key hash length: ${hashHex.length}`);
-  }
-  const ownerKh = Uint8Array.from(Buffer.from(hashHex, "hex"));
-  const poolBech32 = liquidityPoolAddressBech32();
-  const inline = toCBORHex(encodePoolDatum(ownerKh));
+  return withLucidPreprod(async (lucid) => {
+    lucid.selectWalletFromSeed(mnemonic);
+    const userBech32 = await lucid.wallet.address();
+    const details = lucid.utils.getAddressDetails(userBech32);
+    if (details.paymentCredential?.type !== "Key") {
+      throw new Error("Expected key payment credential for pool datum owner");
+    }
+    const hashHex = details.paymentCredential.hash;
+    if (hashHex.length !== 56) {
+      throw new Error(`Unexpected payment key hash length: ${hashHex.length}`);
+    }
+    const ownerKh = Uint8Array.from(Buffer.from(hashHex, "hex"));
+    const poolBech32 = liquidityPoolAddressBech32();
+    const inline = toCBORHex(encodePoolDatum(ownerKh));
 
-  const utxos = await lucid.wallet.getUtxos();
-  let total = 0n;
-  for (const u of utxos) {
-    total += u.assets.lovelace;
-  }
+    const utxos = await lucid.wallet.getUtxos();
+    let total = 0n;
+    for (const u of utxos) {
+      total += u.assets.lovelace;
+    }
 
-  const reserve = poolDepositReserveLovelace();
-  if (total < params.lovelace + reserve) {
-    throw new Error(
-      `Saldo insuficiente: wallet ${total} lovelace; envío ${params.lovelace} + reserva fees ${reserve} = ${params.lovelace + reserve}. Bajá el monto o POOL_DEPOSIT_RESERVE_LOVELACE.`,
-    );
-  }
+    const reserve = poolDepositReserveLovelace();
+    if (total < params.lovelace + reserve) {
+      throw new Error(
+        `Saldo insuficiente: wallet ${total} lovelace; envío ${params.lovelace} + reserva fees ${reserve} = ${params.lovelace + reserve}. Bajá el monto o POOL_DEPOSIT_RESERVE_LOVELACE.`,
+      );
+    }
 
-  const tx = await lucid
-    .newTx()
-    .payToContract(poolBech32, { inline: inline }, { lovelace: params.lovelace })
-    .complete();
+    const tx = await lucid
+      .newTx()
+      .payToContract(poolBech32, { inline: inline }, { lovelace: params.lovelace })
+      .complete();
 
-  const signed = await tx.sign().complete();
-  return signed.submit();
+    const signed = await tx.sign().complete();
+    return signed.submit();
+  });
 }
 
 function poolPlutusV3(): PlutusV3 {

@@ -9,7 +9,7 @@ const KOIOS_PREPROD = "https://preprod.koios.rest/api/v1";
 export type PreprodChainBackend = "blockfrost" | "maestro" | "koios";
 
 /**
- * Misma prioridad que `newLucidPreprod`: Blockfrost → Maestro → Koios.
+ * Misma prioridad que Lucid (`withLucidPreprod`): Blockfrost → Maestro → Koios.
  * Koios depende de `/ogmios` en el servidor; sin token o con carga, suele fallar en evaluateTx.
  */
 export function preprodEvolutionProviderConfig():

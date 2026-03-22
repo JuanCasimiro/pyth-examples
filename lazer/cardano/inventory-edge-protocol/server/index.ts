@@ -2,7 +2,7 @@
  * Local judge demo API: signs with CARDANO_MNEMONIC from `.env` (PreProd only).
  * Run with `npm run dev:api` from repo root; UI proxies `/api` in dev.
  */
-import "dotenv/config";
+import "./load_env.js";
 
 import * as Address from "@evolution-sdk/evolution/Address";
 import * as AssetName from "@evolution-sdk/evolution/AssetName";
@@ -26,10 +26,11 @@ import {
   PYTH_LAZER_FEEDS,
 } from "../lib/feeds.js";
 import {
-  listWalletNativeNfts,
-  listWalletShadowNfts,
+  listWalletShadowAndNative,
+  type WalletNativeNft,
+  type WalletShadowNft,
 } from "../lib/wallet_shadow_nfts.js";
-import { mintShadowNft } from "../lib/mint_shadow.js";
+import { mintShadowNftSubprocess } from "../lib/mint_shadow_subprocess.js";
 import { PYTH_POLICY_ID_HEX } from "../lib/pyth.js";
 import {
   fetchFeedQuoteResolved,
@@ -68,23 +69,33 @@ import {
   withdrawAllLiquidityPoolOnChain,
 } from "../lib/pool_onchain.js";
 import {
-  appendAudit,
-  loadPool,
-  LOAN_REPAY_INTEREST_BPS,
-  poolCancelReservation,
-  poolCommitLoan,
-  poolDeposit,
-  poolEffectiveAvailableForInsuranceReserve,
-  poolFinalizeCloseVault,
-  poolOnDebtAdjusted,
-  poolOnLiquidateLoan,
-  poolReleaseOnClaim,
-  poolReserveForHedge,
-  poolWithdraw,
-  readAudit,
-} from "../lib/judge_store.js";
+  effectiveAvailableForHedgePayout,
+  getPoolStateFromChain,
+  nftLoanKey,
+  type PoolStateFromChain,
+} from "../lib/pool_chain_state.js";
+import { appendAudit, readAudit } from "../lib/judge_store.js";
 
 const PORT = Number(process.env.JUDGE_API_PORT ?? 8787);
+
+/** Referencia en textos de auditoría (la amortización no mueve tADA en cadena en este MVP). */
+const LOAN_REPAY_INTEREST_BPS = 100n;
+
+function emptyPoolState(): PoolStateFromChain {
+  return {
+    poolScriptTotalLovelace: "0",
+    availableLovelace: "0",
+    encumberedLovelace: "0",
+    deployedToLoansLovelace: "0",
+    totalDepositedLovelace: "0",
+    totalPaidOutLovelace: "0",
+    totalRepaidPrincipalLovelace: "0",
+    profitsFromLoansLovelace: "0",
+    profitsFromInsuranceLovelace: "0",
+    reservations: [],
+    outstandingLoans: {},
+  };
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -156,10 +167,11 @@ app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     preprod: true,
-    hasMnemonic: Boolean(process.env.CARDANO_MNEMONIC),
-    hasAccessToken: Boolean(process.env.ACCESS_TOKEN),
+    hasMnemonic: Boolean(process.env.CARDANO_MNEMONIC?.trim()),
+    hasAccessToken: Boolean(process.env.ACCESS_TOKEN?.trim()),
     hasBlockfrostOrMaestro: Boolean(
-      process.env.BLOCKFROST_PROJECT_ID ?? process.env.MAESTRO_API_KEY,
+      process.env.BLOCKFROST_PROJECT_ID?.trim() ??
+        process.env.MAESTRO_API_KEY?.trim(),
     ),
     /** Evolution (vault txs) usa este backend para evaluar scripts; Koios/ogmios público suele fallar. */
     evolutionChainBackend: preprodChainBackendLabel(),
@@ -221,17 +233,33 @@ app.get("/api/wallet", async (_req, res) => {
         }
       }
     }
-    const shadows = await listWalletShadowNfts(mnemonic);
-    const native = await listWalletNativeNfts(mnemonic);
+    let lucidAddress = "";
+    let paymentKeyHashHex = "";
+    let nativeNfts: WalletNativeNft[] = [];
+    let shadowNfts: WalletShadowNft[] = [];
+    let lucidError: string | undefined;
+    try {
+      const { shadows, native } = await listWalletShadowAndNative(mnemonic);
+      lucidAddress = shadows.address;
+      paymentKeyHashHex = native.paymentKeyHashHex;
+      nativeNfts = native.nfts;
+      shadowNfts = shadows.nfts;
+    } catch (e) {
+      lucidError =
+        e instanceof Error ? e.message : String(e);
+    }
     res.json({
       address: Address.toBech32(addr),
-      lucidAddress: shadows.address,
+      lucidAddress: lucidAddress || undefined,
+      /** Mismo criterio que datum `owner` del vault (Lucid payment key). */
+      paymentKeyHashHex: paymentKeyHashHex || undefined,
       lovelace: lovelace.toString(),
       adaApprox: (Number(lovelace) / 1e6).toFixed(6),
       nftCount: nfts.length,
       nfts,
-      nativeNfts: native.nfts,
-      shadowNfts: shadows.nfts,
+      nativeNfts,
+      shadowNfts,
+      ...(lucidError ? { lucidError } : {}),
     });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
@@ -284,93 +312,20 @@ app.get("/api/audit", (req, res) => {
   res.json({ events: readAudit(limit) });
 });
 
-app.get("/api/mock/pool", (_req, res) => {
+/** Pool: totales desde script `liquidity_pool` + vaults (deuda y hedge en datum). */
+app.get("/api/pool/state", async (_req, res) => {
   try {
-    res.json(loadPool());
+    if (!process.env.CARDANO_MNEMONIC?.trim()) {
+      res.json(emptyPoolState());
+      return;
+    }
+    res.json(await getPoolStateFromChain());
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
 });
 
-app.post("/api/mock/pool/deposit", (req, res) => {
-  try {
-    const raw = req.body?.lovelace;
-    if (raw == null) {
-      res.status(400).json({ error: "lovelace required" });
-      return;
-    }
-    const lovelace = BigInt(String(raw));
-    if (lovelace <= 0n) {
-      res.status(400).json({ error: "lovelace must be positive" });
-      return;
-    }
-    const p = poolDeposit(lovelace);
-    appendAudit({
-      kind: "mock_pool_deposit",
-      summary: `Depósito demo al pool de seguros: ${lovelace} lovelace`,
-      extra: { lovelace: lovelace.toString() },
-    });
-    res.json(p);
-  } catch (e) {
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
-  }
-});
-
-/**
- * Suma al pool mock un % del lovelace total que ve la wallet (Evolution).
- * No construye ni envía tx: no mueve ADA on-chain.
- */
-app.post("/api/mock/pool/deposit-wallet-percent", async (req, res) => {
-  try {
-    const pct = Number(req.body?.percent ?? 80);
-    if (!Number.isFinite(pct) || pct < 1 || pct > 100 || Math.floor(pct) !== pct) {
-      res.status(400).json({ error: "percent debe ser entero entre 1 y 100" });
-      return;
-    }
-    const mnemonic = requireMnemonic();
-    const client = createPreprodSigningClient(mnemonic);
-    const utxos = await client.getWalletUtxos();
-    let total = 0n;
-    for (const u of utxos) {
-      total += u.assets.lovelace;
-    }
-    if (total <= 0n) {
-      res.status(400).json({
-        error: "La wallet no tiene lovelace según el proveedor (Evolution).",
-      });
-      return;
-    }
-    const amount = (total * BigInt(pct)) / 100n;
-    if (amount <= 0n) {
-      res.status(400).json({
-        error: `Con saldo ${total} lovelace, el ${pct}% redondea a 0. Aumentá el saldo o usá depósito manual.`,
-        walletLovelace: total.toString(),
-      });
-      return;
-    }
-    const p = poolDeposit(amount);
-    appendAudit({
-      kind: "mock_pool_deposit_wallet_pct",
-      summary: `Pool mock +${amount} lovelace (${pct}% de wallet ${total})`,
-      extra: {
-        percent: pct,
-        walletLovelace: total.toString(),
-        depositedLovelace: amount.toString(),
-      },
-    });
-    res.json({
-      pool: p,
-      walletLovelace: total.toString(),
-      depositedLovelace: amount.toString(),
-      percent: pct,
-      note: "Solo contabilidad en data/mock_insurance_pool.json — no se firmó ninguna transacción Cardano.",
-    });
-  } catch (e) {
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
-  }
-});
-
-/** Depósito real al script `liquidity_pool` + sincroniza el pool mock. */
+/** Depósito real al script `liquidity_pool` (estado del pool = lectura de cadena). */
 app.post("/api/pool/onchain/deposit-percent", async (req, res) => {
   try {
     const pct = Number(req.body?.percent ?? 80);
@@ -384,7 +339,20 @@ app.post("/api/pool/onchain/deposit-percent", async (req, res) => {
       return;
     }
     const reserve = poolDepositReserveLovelace();
-    const amount = (total * BigInt(pct)) / 100n;
+    if (total <= reserve) {
+      res.status(400).json({
+        error: `Saldo ${total} lovelace ≤ reserva fees ${reserve}. Necesitás más tADA o bajá POOL_DEPOSIT_RESERVE_LOVELACE en .env.`,
+        walletLovelace: total.toString(),
+        reserveLovelace: reserve.toString(),
+      });
+      return;
+    }
+    /** Plain pct of wallet (integer division). */
+    const byPercent = (total * BigInt(pct)) / 100n;
+    /** Max send while leaving `reserve` for tx fees (same rule as `depositLiquidityPoolOnChain`). */
+    const maxAfterReserve = total - reserve;
+    const amount =
+      byPercent <= maxAfterReserve ? byPercent : maxAfterReserve;
     if (amount <= 0n) {
       res.status(400).json({
         error: `El ${pct}% redondea a 0.`,
@@ -392,18 +360,9 @@ app.post("/api/pool/onchain/deposit-percent", async (req, res) => {
       });
       return;
     }
-    if (amount + reserve > total) {
-      res.status(400).json({
-        error:
-          `Saldo ${total} lovelace: el ${pct}% son ${amount}; necesitás ~${reserve} extra para fees. Bajá el % o POOL_DEPOSIT_RESERVE_LOVELACE.`,
-        walletLovelace: total.toString(),
-        requestedLovelace: amount.toString(),
-        reserveLovelace: reserve.toString(),
-      });
-      return;
-    }
+    const cappedToReserve = byPercent > maxAfterReserve;
     const txHash = await depositLiquidityPoolOnChain({ lovelace: amount });
-    const p = poolDeposit(amount);
+    const p = await getPoolStateFromChain();
     appendAudit({
       kind: "pool_onchain_deposit_pct",
       summary: `Pool on-chain +${amount} lovelace (${pct}% wallet)`,
@@ -421,6 +380,13 @@ app.post("/api/pool/onchain/deposit-percent", async (req, res) => {
       depositedLovelace: amount.toString(),
       percent: pct,
       liquidityPoolAddressBech32: liquidityPoolAddressBech32(),
+      ...(cappedToReserve
+        ? {
+            note: `Pediste ${pct}% (${byPercent} lovelace) pero solo cabe ${maxAfterReserve} sin tocar la reserva de fees (${reserve}). Se depositó ese máximo.`,
+            requestedByPercentLovelace: byPercent.toString(),
+            reserveLovelace: reserve.toString(),
+          }
+        : {}),
     });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
@@ -440,7 +406,7 @@ app.post("/api/pool/onchain/deposit", async (req, res) => {
       return;
     }
     const txHash = await depositLiquidityPoolOnChain({ lovelace: amount });
-    const p = poolDeposit(amount);
+    const p = await getPoolStateFromChain();
     appendAudit({
       kind: "pool_onchain_deposit",
       summary: `Pool on-chain +${amount} lovelace`,
@@ -472,12 +438,12 @@ app.get("/api/pool/onchain/positions", async (_req, res) => {
   }
 });
 
-/** Gasta todos los UTxOs del pool con tu owner en datum; sincroniza pool mock. */
+/** Gasta todos los UTxOs del pool con tu owner en datum. */
 app.post("/api/pool/onchain/withdraw-all", async (_req, res) => {
   try {
     const { txHash, withdrawnLovelace, inputCount } =
       await withdrawAllLiquidityPoolOnChain();
-    const p = poolWithdraw(BigInt(withdrawnLovelace));
+    const p = await getPoolStateFromChain();
     appendAudit({
       kind: "pool_onchain_withdraw_all",
       summary: `Pool on-chain retiro ${withdrawnLovelace} lovelace (${inputCount} inputs)`,
@@ -499,7 +465,7 @@ app.post("/api/pool/onchain/withdraw-all", async (_req, res) => {
 app.post("/api/mint", async (req, res) => {
   try {
     const slot = parseSlot(String(req.body?.slot ?? ""));
-    const out = await mintShadowNft(slot);
+    const out = await mintShadowNftSubprocess(slot);
     appendAudit({
       kind: "mint_shadow",
       summary: `Mint NFT sombra (${out.slot}) · ${out.assetName}`,
@@ -546,11 +512,20 @@ app.post("/api/vault/open", async (req, res) => {
     const nm = String(nftNameHex);
     const loan = BigInt(debtLovelace ?? "0");
     if (loan > 0n) {
-      const av = BigInt(loadPool().availableLovelace);
+      const st = await getPoolStateFromChain();
+      if (st.outstandingLoans[nftLoanKey(pol, nm)]) {
+        res.status(400).json({
+          error:
+            "Ya existe una vault con deuda on-chain para este NFT (cerrala o usá otro activo).",
+          code: "VAULT_ALREADY_OWES",
+        });
+        return;
+      }
+      const av = BigInt(st.availableLovelace);
       if (av < loan) {
         res.status(400).json({
           error:
-            `El pool no tiene tADA suficientes para financiar este préstamo. Disponible: ${av} lovelace; solicitado: ${loan}. Depositá liquidez mock en la pestaña Seguros.`,
+            `El pool no tiene tADA suficientes para financiar este préstamo. Disponible (cadena): ${av} lovelace; solicitado: ${loan}. Depositá tADA al contrato pool on-chain (pestaña Seguros).`,
           code: "POOL_INSUFFICIENT_FUNDS",
           availableLovelace: av.toString(),
           requestedLovelace: loan.toString(),
@@ -565,13 +540,6 @@ app.post("/api/vault/open", async (req, res) => {
       debtLovelace: loan,
       collateralQty: BigInt(collateralQty ?? "1"),
     });
-    if (loan > 0n) {
-      poolCommitLoan({
-        nftPolicyHex: pol,
-        nftNameHex: nm,
-        loanLovelace: loan,
-      });
-    }
     appendAudit({
       kind: "vault_open",
       summary:
@@ -603,14 +571,11 @@ app.post("/api/vault/hedge", async (req, res) => {
     const decoded = decodeVaultDatum(readInlineDatum(u));
     const payoutReq = BigInt(payoutLovelace ?? "0");
     if (payoutReq > 0n) {
-      const eff = poolEffectiveAvailableForInsuranceReserve(
-        decoded.nftPolicyHex,
-        decoded.nftNameHex,
-      );
+      const eff = await effectiveAvailableForHedgePayout(u);
       if (eff < payoutReq) {
         res.status(400).json({
           error:
-            `El pool no puede respaldar este payout (${payoutReq} lovelace). Liquidez efectiva para esta cobertura: ${eff}. Aportá más tADA mock o bajá el payout.`,
+            `El pool no puede respaldar este payout (${payoutReq} lovelace). Liquidez efectiva para esta cobertura: ${eff}. Aportá más tADA on-chain al pool o bajá el payout.`,
           code: "POOL_INSUFFICIENT_FUNDS",
           requestedLovelace: payoutReq.toString(),
           effectiveAvailableLovelace: eff.toString(),
@@ -637,30 +602,20 @@ app.post("/api/vault/hedge", async (req, res) => {
       decoded.nftNameHex,
     );
     if (nextRef) {
-      const { reserved, shortfall } = poolReserveForHedge({
-        nftPolicyHex: decoded.nftPolicyHex,
-        nftNameHex: decoded.nftNameHex,
-        vaultRef: nextRef,
-        payoutRequested: payoutReq,
-      });
       appendAudit({
-        kind: "mock_pool_reserve",
-        summary:
-          shortfall > 0n
-            ? `Pool: apartado ${reserved} lovelace; shortfall ${shortfall} (inconsistencia — revisar)`
-            : `Pool: apartado ${reserved} lovelace para cobertura`,
+        kind: "vault_hedge_onchain",
+        summary: `Cobertura en datum vault (cap ${payoutReq} lovelace) · ref ${nextRef}`,
         txHash: h,
         extra: {
           vaultRef: nextRef,
-          reserved: reserved.toString(),
-          shortfall: shortfall.toString(),
+          payoutLovelace: payoutReq.toString(),
         },
       });
     } else {
       appendAudit({
-        kind: "mock_pool_reserve_skipped",
+        kind: "pool_reserve_hedge_skipped",
         summary:
-          "Pool mock: no se encontró la vault tras hedge (indexador); reintentá o reservá tras refrescar.",
+          "No se encontró la vault tras hedge (indexador); reintentá o reservá tras refrescar.",
         txHash: h,
       });
     }
@@ -685,7 +640,7 @@ app.post("/api/vault/adjust", async (req, res) => {
     const newD = BigInt(newDebtLovelace);
     if (newD > oldD) {
       const need = newD - oldD;
-      const av = BigInt(loadPool().availableLovelace);
+      const av = BigInt((await getPoolStateFromChain()).availableLovelace);
       if (av < need) {
         res.status(400).json({
           error:
@@ -701,15 +656,9 @@ app.post("/api/vault/adjust", async (req, res) => {
       vaultUtxo: u,
       newDebtLovelace: newD,
     });
-    poolOnDebtAdjusted({
-      nftPolicyHex: prev.nftPolicyHex,
-      nftNameHex: prev.nftNameHex,
-      oldDebtLovelace: oldD,
-      newDebtLovelace: newD,
-    });
     appendAudit({
       kind: "vault_adjust",
-      summary: `adjustDebt ${oldD.toString()} → ${newD.toString()} (interés demo al amortizar: ${LOAN_REPAY_INTEREST_BPS} bps del principal devuelto)`,
+      summary: `adjustDebt on-chain ${oldD.toString()} → ${newD.toString()} (referencia demo: ${LOAN_REPAY_INTEREST_BPS} bps no mueve tADA en este MVP)`,
       txHash: h,
     });
     res.json({ txHash: h });
@@ -728,16 +677,6 @@ app.post("/api/vault/close", async (req, res) => {
     const u = await getVaultUtxoByRef(String(txHash), Number(outputIndex));
     const decoded = decodeVaultDatum(readInlineDatum(u));
     const h = await closeVault({ vaultUtxo: u });
-    if (decoded.hedge.tag === "some") {
-      poolCancelReservation({
-        nftPolicyHex: decoded.nftPolicyHex,
-        nftNameHex: decoded.nftNameHex,
-      });
-    }
-    poolFinalizeCloseVault({
-      nftPolicyHex: decoded.nftPolicyHex,
-      nftNameHex: decoded.nftNameHex,
-    });
     appendAudit({
       kind: "vault_close",
       summary: "closeVault (debt=0)",
@@ -768,18 +707,9 @@ app.post("/api/vault/liquidate", async (req, res) => {
       vaultUtxo: u,
       priceFeedId: Number(priceFeedId),
     });
-    poolCancelReservation({
-      nftPolicyHex: decoded.nftPolicyHex,
-      nftNameHex: decoded.nftNameHex,
-    });
-    poolOnLiquidateLoan({
-      nftPolicyHex: decoded.nftPolicyHex,
-      nftNameHex: decoded.nftNameHex,
-      debtLovelace: decoded.debtLovelace,
-    });
     appendAudit({
       kind: "vault_liquidate",
-      summary: `liquidate (venta simulada de colateral → pool) · deuda ${decoded.debtLovelace.toString()} · feed ${priceFeedId}`,
+      summary: `liquidate on-chain · deuda ${decoded.debtLovelace.toString()} · feed ${priceFeedId}`,
       txHash: h,
       extra: {
         nftPolicyHex: decoded.nftPolicyHex,
@@ -807,22 +737,13 @@ app.post("/api/vault/claim", async (req, res) => {
       vaultUtxo: u,
       priceFeedId: Number(priceFeedId),
     });
-    const rel = poolReleaseOnClaim({
-      nftPolicyHex: decoded.nftPolicyHex,
-      nftNameHex: decoded.nftNameHex,
-    });
     appendAudit({
       kind: "vault_claim",
-      summary: rel.found
-        ? `claimInsurance: pago simulado ${rel.paidOut} lovelace; fee pool ${rel.poolFee}`
-        : "claimInsurance (sin reserva previa en pool mock)",
+      summary: `claimInsurance on-chain (payout según outputs de la tx)`,
       txHash: h,
       extra: {
         nftPolicyHex: decoded.nftPolicyHex,
         nftNameHex: decoded.nftNameHex,
-        poolReleased: rel.released.toString(),
-        poolFee: rel.poolFee.toString(),
-        poolFound: rel.found,
       },
     });
     res.json({ txHash: h });
@@ -931,7 +852,7 @@ app.get("/api/risk", async (req, res) => {
     const marketOpen = Boolean(q.priceRaw);
     const loanPoolNote =
       `On-chain: el validador compara precio×colateral vs principal en datum. ` +
-      `Intereses: demo off-chain (${LOAN_REPAY_INTEREST_BPS} bps sobre lo amortizado) van al pool al bajar la deuda.`;
+      `La deuda solo cambia con txs (Adjust/Close/Liquidate/Claim). Referencia demo: ${LOAN_REPAY_INTEREST_BPS} bps no mueve tADA en este MVP.`;
     res.json({
       ref: `${txHash}#${outputIndex}`,
       feedId,

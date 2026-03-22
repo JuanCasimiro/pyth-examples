@@ -25,7 +25,7 @@ import {
   createPreprodReadClient,
   createPreprodSigningClient,
 } from "./evolution_client.js";
-import { newLucidPreprod } from "./mint_shadow.js";
+import { withLucidPreprod } from "./mint_shadow.js";
 import { fetchSolanaFormatUpdate, PYTH_POLICY_ID_HEX } from "./pyth.js";
 import { enterpriseVaultAddress, paymentKeyHashBytes } from "./vault_address.js";
 import type { UTxO } from "@evolution-sdk/evolution/UTxO";
@@ -70,52 +70,53 @@ export async function openVault(params: {
   const val = vaultSpendValidator(bp);
   const vaultBech32 = Address.toBech32(enterpriseVaultAddress(val.hash));
 
-  const lucid = await newLucidPreprod();
-  lucid.selectWalletFromSeed(mnemonic);
-  const userBech32 = await lucid.wallet.address();
-  const ownerKh = paymentKeyHashBytes(Address.fromBech32(userBech32));
-
   const policyHex = normalizeAssetHex(params.nftPolicyHex);
   const nameHex = normalizeAssetHex(params.nftNameHex);
   const unit = policyHex + nameHex;
 
-  const utxos = await lucid.wallet.getUtxos();
-  const nftIn = utxos.find((u) => u.assets[unit] === 1n);
-  if (!nftIn) {
-    const sample = utxos.flatMap((u) =>
-      Object.entries(u.assets)
-        .filter(([k, q]) => k !== "lovelace" && q === 1n)
-        .map(([k]) => k),
-    );
-    throw new Error(
-      `No UTxO with NFT (vista Lucid/Blockfrost). Unit esperado: ${unit}. ` +
-        `NFTs (qty=1) en wallet: ${
-          sample.length ? sample.slice(0, 12).join(" | ") : "(ninguno)"
-        }. ¿El NFT ya está en la vault o usás otra seed?`,
-    );
-  }
+  return withLucidPreprod(async (lucid) => {
+    lucid.selectWalletFromSeed(mnemonic);
+    const userBech32 = await lucid.wallet.address();
+    const ownerKh = paymentKeyHashBytes(Address.fromBech32(userBech32));
 
-  const datum = encodeVaultDatum({
-    ownerKeyHash: ownerKh,
-    pythPolicyHex: PYTH_POLICY_ID_HEX,
-    nftPolicyHex: policyHex,
-    nftNameHex: nameHex,
-    debtLovelace: params.debtLovelace,
-    collateralQty: params.collateralQty,
-    feedId: BigInt(params.feedId),
-    hedge: optionNone(),
+    const utxos = await lucid.wallet.getUtxos();
+    const nftIn = utxos.find((u) => u.assets[unit] === 1n);
+    if (!nftIn) {
+      const sample = utxos.flatMap((u) =>
+        Object.entries(u.assets)
+          .filter(([k, q]) => k !== "lovelace" && q === 1n)
+          .map(([k]) => k),
+      );
+      throw new Error(
+        `No UTxO with NFT (vista Lucid/Blockfrost). Unit esperado: ${unit}. ` +
+          `NFTs (qty=1) en wallet: ${
+            sample.length ? sample.slice(0, 12).join(" | ") : "(ninguno)"
+          }. ¿El NFT ya está en la vault o usás otra seed?`,
+      );
+    }
+
+    const datum = encodeVaultDatum({
+      ownerKeyHash: ownerKh,
+      pythPolicyHex: PYTH_POLICY_ID_HEX,
+      nftPolicyHex: policyHex,
+      nftNameHex: nameHex,
+      debtLovelace: params.debtLovelace,
+      collateralQty: params.collateralQty,
+      feedId: BigInt(params.feedId),
+      hedge: optionNone(),
+    });
+
+    const inlineDatum = toCBORHex(datum);
+
+    const tx = await lucid
+      .newTx()
+      .collectFrom([nftIn])
+      .payToContract(vaultBech32, { inline: inlineDatum }, nftIn.assets)
+      .complete();
+
+    const signed = await tx.sign().complete();
+    return await signed.submit();
   });
-
-  const inlineDatum = toCBORHex(datum);
-
-  const tx = await lucid
-    .newTx()
-    .collectFrom([nftIn])
-    .payToContract(vaultBech32, { inline: inlineDatum }, nftIn.assets)
-    .complete();
-
-  const signed = await tx.sign().complete();
-  return await signed.submit();
 }
 
 /** Owner adds parametric insurance fields (strike + payout) — no Pyth. */

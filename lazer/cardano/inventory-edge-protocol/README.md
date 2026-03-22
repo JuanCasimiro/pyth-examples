@@ -4,6 +4,23 @@ RealFi / RWA hackathon MVP: a **Cardano vault** that locks a demo NFT, tracks sy
 
 **Narrative deck (why it matters):** see [PITCH.md](./PITCH.md).
 
+**Location in `pyth-examples`:** `lazer/cardano/inventory-edge-protocol/` (from repo root, `cd` into this folder before `npm install`).
+
+### For judges (static review first)
+
+Contract logic is reviewable **without** running the browser demo or holding keys:
+
+| Priority | Artifact | Why it matters |
+|----------|----------|----------------|
+| **1** | [`onchain/validators/vault.ak`](onchain/validators/vault.ak) | Datum/redeemers, `pyth.get_updates`, liquidation and insurance checks. |
+| **2** | [`onchain/plutus.json`](onchain/plutus.json) | Committed blueprint; rebuild with `npm run build:onchain` if you want to verify it matches sources. |
+| **3** | [`onchain/validators/liquidity_pool.ak`](onchain/validators/liquidity_pool.ak) | tADA pool validator used with the pool APIs / UI. |
+| **4** | [`PITCH.md`](./PITCH.md) | Product story, honest limits, alignment with Pyth Lazer examples. |
+
+**Optional, no secrets:** `npm install` → `npm run build:onchain` (needs [Aiken](https://aiken-lang.org) **1.1+**; first build may need network to fetch the git dependency in `onchain/aiken.toml`) → `npx tsc` (typechecks `lib/`, `scripts/`, `server/` only; the Vite app under `web/` is separate).
+
+The **judge UI** (`npm run demo`) is for operator demos only; it is **not** required to score the on-chain design.
+
 ---
 
 ## 1. What on-chain contracts did we ship?
@@ -28,7 +45,7 @@ We do **not** deploy a separate Pyth contract. We integrate the **existing Pyth 
 |----------|--------|
 | **Pyth Lazer governance `PolicyId` (PreProd, hex)** | `d799d287105dea9377cdf9ea8502a83d2b9eb2d2050a8aea800a21e6` |
 
-That matches the reference integration in [`pyth-examples/lazer/cardano/lazer-rwa`](https://github.com/pyth-network/pyth-examples/tree/main/lazer/cardano/lazer-rwa).
+That is the same **PreProd governance policy** used by the official Pyth Lazer Cardano integration in [`pyth-network/pyth-lazer-cardano`](https://github.com/pyth-network/pyth-lazer-cardano) (this example depends on that library via `onchain/aiken.toml`). For product docs, see [Pyth Lazer](https://docs.pyth.network/lazer).
 
 **Shadow NFTs** are **native assets** minted off-chain (Lucid + signing policy), **not** minted by this Aiken project. Metadata is **CIP-25** label `721` with fields such as `pyth_lazer_feed_id` and `inventory_edge_class` (see `scripts/mock_assets.ts`).
 
@@ -67,9 +84,9 @@ That matches the reference integration in [`pyth-examples/lazer/cardano/lazer-rw
 | Layer | Tech | Used for |
 |-------|------|----------|
 | Mint + metadata | **Lucid** + **Blockfrost** (or **Maestro**) | `npm run mock-assets` or judge UI mint — PreProd NFT demo. |
-| Vault txs + Pyth witness | **Evolution SDK** + **Blockfrost o Maestro** (misma prioridad que Lucid; Koios solo si no hay ninguno) | `openVault`, `applyHedge`, `adjustDebt`, `closeVault`, `liquidate`, `claimInsurance` en [`lib/transactions.ts`](lib/transactions.ts). |
-| Pool de liquidez (tADA) | **Aiken** [`onchain/validators/liquidity_pool.ak`](onchain/validators/liquidity_pool.ak) + **Lucid** (depósito) + **Evolution** (retiro Plutus V3) [`lib/pool_onchain.ts`](lib/pool_onchain.ts) | Datum = tu payment key hash; solo vos podés gastar. API: `POST /api/pool/onchain/deposit-percent`, `GET /api/pool/onchain/positions`, `POST /api/pool/onchain/withdraw-all`. |
-| Judge UI | **Vite + React** + **Express** (local API) | `npm run demo` — mint, vault, pool on-chain/mock, hedge, Pyth risk, liquidate / claim. |
+| Vault txs + Pyth witness | **Evolution SDK** + **Blockfrost** or **Maestro** (same priority as Lucid; **Koios** only if neither is available) | `openVault`, `applyHedge`, `adjustDebt`, `closeVault`, `liquidate`, `claimInsurance` in [`lib/transactions.ts`](lib/transactions.ts). |
+| Liquidity pool (tADA) | **Aiken** [`onchain/validators/liquidity_pool.ak`](onchain/validators/liquidity_pool.ak) + **Lucid** (deposit) + **Evolution** (Plutus v3 withdraw) [`lib/pool_onchain.ts`](lib/pool_onchain.ts) | Datum locks to your payment key hash (only you can spend). API: `POST /api/pool/onchain/deposit-percent`, `GET /api/pool/onchain/positions`, `POST /api/pool/onchain/withdraw-all`. |
+| Judge UI | **Vite + React** + **Express** (local API) | `npm run demo` — mint, vault, pool balances read from chain (script + vault datums), hedge, Pyth risk, liquidate / claim. Optional local audit: `data/judge_audit.json`. |
 | Oracle payload | **@pythnetwork/pyth-lazer-sdk** | Fetch latest update in Solana binary encoding. |
 | Pyth state resolution | **@pythnetwork/pyth-lazer-cardano-js** | `getPythState` / `getPythScriptHash`. |
 
@@ -104,7 +121,8 @@ inventory-edge-protocol/
     ├── aiken.toml
     ├── plutus.json           ← Blueprint (commit after build)
     └── validators/
-        └── vault.ak          ← Core contract
+        ├── vault.ak              ← Core vault contract
+        └── liquidity_pool.ak   ← tADA pool validator
 ```
 
 ---
@@ -114,11 +132,23 @@ inventory-edge-protocol/
 **Prerequisites:** Node 20+, [Aiken](https://aiken-lang.org) 1.1+, PreProd **tADA**, **Pyth Lazer** `ACCESS_TOKEN`, and **Blockfrost Preprod** `BLOCKFROST_PROJECT_ID` or **Maestro** `MAESTRO_API_KEY`.
 
 ```bash
-cd inventory-edge-protocol
+cd lazer/cardano/inventory-edge-protocol   # if you cloned pyth-examples from its root
 npm install
 npm run build:onchain    # produces onchain/plutus.json
 npx tsc                  # optional typecheck
 ```
+
+**`package.json` scripts:**
+
+| Script | Purpose |
+|--------|---------|
+| `build:onchain` | `aiken build` in `onchain/` |
+| `mock-assets` | Mint demo shadow NFTs (`scripts/mock_assets.ts`) |
+| `tx:open-vault` / `tx:hedge` / `tx:liquidate` | CLI flows in `scripts/` |
+| `dev:api` | Express judge API only (`server/index.ts`) |
+| `dev:web` | Vite dev server for `web/` |
+| `demo` | API + web together (`concurrently`) |
+| `build:web` / `preview:web` | Production build / preview for the UI |
 
 **Environment:** copy `.env.example` → `.env` and fill secrets (never commit `.env`).
 
@@ -129,6 +159,8 @@ npx tsc                  # optional typecheck
 | `BLOCKFROST_PROJECT_ID` or `MAESTRO_API_KEY` | Lucid chain access for mint |
 | `SHADOW_POLICY_ID` / `SHADOW_NAME_HEX` | After mint, to open vault |
 | `SHADOW_ASSET` | `XAU_USD` \| `WTI_USD` \| `BTC_USD` (feeds in `lib/feeds.ts`) |
+
+**Loader:** `server/load_env.ts` reads `.env` from the **package root** (parent of `server/`), not from whatever the current working directory is — useful when debugging “API sees no env”.
 
 **Suggested demo sequence:**
 
@@ -148,21 +180,32 @@ npm run demo
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173). The UI proxies `/api` to `http://127.0.0.1:8787` (override with `JUDGE_API_PORT`). Signing stays server-side via `CARDANO_MNEMONIC` — suitable for hackathon booths, not for production custody.
 
+**CLI vs UI:** `package.json` only wires **open-vault**, **hedge**, and **liquidate** as `tx:*` scripts. **Close**, **adjust debt**, **claim insurance**, and **liquidity pool** flows live in [`lib/transactions.ts`](lib/transactions.ts) / [`lib/pool_onchain.ts`](lib/pool_onchain.ts) and are driven from the **judge API** when you run `npm run demo` (or via your own `tsx` one-liner).
+
 ---
 
 ## 6. External references (for comparison)
 
-- **Pyth Lazer Cardano + Aiken:** [`pyth-lazer-cardano`](https://github.com/pyth-network/pyth-lazer-cardano) (dependency in `onchain/aiken.toml`).
-- **Reference app in this repo:** `lazer/cardano/lazer-rwa` — minimal Pyth verify tx + `rwa_threshold.ak` threshold pattern.
+- **Pyth Lazer Cardano + Aiken:** [`pyth-lazer-cardano`](https://github.com/pyth-network/pyth-lazer-cardano) (dependency in `onchain/aiken.toml`; `pyth.get_updates` and PreProd policy id come from there).
+- **Pyth Lazer docs:** [docs.pyth.network — Lazer](https://docs.pyth.network/lazer) (access token, feeds, integration concepts).
 
 ---
 
-## 7. Honest MVP limits (read before scoring)
+## 7. Honest MVP limits & pitfalls (read before scoring)
 
-- **BTC / WTI feed ids** in `lib/feeds.ts` may be **placeholders**; **XAU (346)** matches the reference app. Confirm ids via Pyth Lazer symbols API before claiming production accuracy.
+**Design / product**
+
+- **BTC / WTI feed ids** in `lib/feeds.ts` may be **placeholders**; **XAU (346)** is aligned with typical Lazer metal feeds — confirm every id via the Lazer symbols API before production use.
 - **Insurance payout:** on-chain we **authorize** `ClaimInsurance` when price &lt; strike; routing exact **payout ADA** to outputs is left as a product-layer refinement (datum already stores `payout_lovelace` for demos).
-- **No dedicated CLI** for `ClaimInsurance` in `package.json` — redeemer exists on-chain; add a script if you need a live demo of that path.
+- **`pyth-lazer-cardano` in `aiken.toml` tracks `main` on GitHub** — reproducible builds depend on fetch time; the **committed** `onchain/plutus.json` (+ lockfile) is what reviewers should treat as the shipped artifact unless they intentionally rebuild.
 - **PreProd only** — do not reuse demo mnemonics or API keys on mainnet.
+
+**If someone runs the live demo (operators, not required for judges)**
+
+- **No `BLOCKFROST_PROJECT_ID` or `MAESTRO_API_KEY`:** Lucid mint and Evolution simulation paths often break; Koios-only setups frequently hit `evaluateTx` failures (see comments in [`.env.example`](./.env.example)).
+- **No `ACCESS_TOKEN` (Pyth Lazer):** `Liquidate` and `ClaimInsurance` cannot be fully exercised — both require the pull-model witness.
+- **`SHADOW_POLICY_ID` / `SHADOW_NAME_HEX` unset:** `tx:open-vault` and related flows fail until set after `mock-assets`.
+- **`ClaimInsurance`:** implemented on-chain and in [`lib/transactions.ts`](lib/transactions.ts); there is **no** `tx:claim-insurance` script — use the judge **API/UI** under `npm run demo` or call the library from a small script.
 
 ---
 

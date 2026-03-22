@@ -3,8 +3,11 @@
  */
 import type { UTxO } from "lucid-cardano";
 
+import * as Address from "@evolution-sdk/evolution/Address";
+
 import { inferFeedFromShadowName } from "./feeds.js";
-import { newLucidPreprod } from "./mint_shadow.js";
+import { withLucidPreprod } from "./mint_shadow.js";
+import { paymentKeyHashBytes } from "./vault_address.js";
 
 function normalizeHex(h: string): string {
   return h.replace(/\s/g, "").toLowerCase();
@@ -35,18 +38,13 @@ export type WalletNativeNft = {
   nameUtf8?: string;
   quantity: string;
   unit: string;
+  /** Al menos un UTxO tiene qty 1 de esta unit (requerido para `openVault`). */
+  hasSingletonUtxo: boolean;
   /** Si el nombre es shadow demo, sugerimos el feed Pyth del mint. */
   suggestedFeedId?: number;
 };
 
-export async function listWalletShadowNfts(mnemonic: string): Promise<{
-  address: string;
-  nfts: WalletShadowNft[];
-}> {
-  const lucid = await newLucidPreprod();
-  lucid.selectWalletFromSeed(mnemonic);
-  const address = await lucid.wallet.address();
-  const utxos = await lucid.wallet.getUtxos();
+function shadowNftsFromUtxos(utxos: UTxO[]): WalletShadowNft[] {
   const byKey = new Map<string, WalletShadowNft>();
 
   for (const u of utxos) {
@@ -76,32 +74,21 @@ export async function listWalletShadowNfts(mnemonic: string): Promise<{
     }
   }
 
-  return {
-    address,
-    nfts: [...byKey.values()].sort((a, b) =>
-      a.nameUtf8.localeCompare(b.nameUtf8),
-    ),
-  };
+  return [...byKey.values()].sort((a, b) =>
+    a.nameUtf8.localeCompare(b.nameUtf8),
+  );
 }
 
-/**
- * Todos los activos nativos (por unit agregada), vía Lucid — coherente con `openVault`.
- */
-export async function listWalletNativeNfts(mnemonic: string): Promise<{
-  address: string;
-  nfts: WalletNativeNft[];
-}> {
-  const lucid = await newLucidPreprod();
-  lucid.selectWalletFromSeed(mnemonic);
-  const address = await lucid.wallet.address();
-  const utxos = await lucid.wallet.getUtxos();
+function nativeNftsFromUtxos(utxos: UTxO[]): WalletNativeNft[] {
   const agg = new Map<string, bigint>();
+  const singletonUnit = new Set<string>();
 
   for (const u of utxos) {
     for (const { unit, qty } of nativeUnitsFromUtxo(u)) {
       if (qty <= 0n) continue;
       const key = normalizeHex(unit);
       agg.set(key, (agg.get(key) ?? 0n) + qty);
+      if (qty === 1n) singletonUnit.add(key);
     }
   }
 
@@ -126,11 +113,15 @@ export async function listWalletNativeNfts(mnemonic: string): Promise<{
       nameUtf8,
       quantity: quantity.toString(),
       unit,
+      hasSingletonUtxo: singletonUnit.has(unit),
       suggestedFeedId: shadowFeed ?? undefined,
     });
   }
 
   nfts.sort((a, b) => {
+    if (a.hasSingletonUtxo !== b.hasSingletonUtxo) {
+      return a.hasSingletonUtxo ? -1 : 1;
+    }
     const qa = BigInt(a.quantity);
     const qb = BigInt(b.quantity);
     if (qa === 1n && qb !== 1n) return -1;
@@ -138,5 +129,34 @@ export async function listWalletNativeNfts(mnemonic: string): Promise<{
     return (a.nameUtf8 ?? a.unit).localeCompare(b.nameUtf8 ?? b.unit);
   });
 
-  return { address, nfts };
+  return nfts;
+}
+
+/**
+ * Una sesión Lucid + un `getUtxos` para sombras y nativos (evita dos `Lucid.new` por request).
+ */
+export async function listWalletShadowAndNative(mnemonic: string): Promise<{
+  shadows: { address: string; nfts: WalletShadowNft[] };
+  native: {
+    address: string;
+    paymentKeyHashHex: string;
+    nfts: WalletNativeNft[];
+  };
+}> {
+  return withLucidPreprod(async (lucid) => {
+    lucid.selectWalletFromSeed(mnemonic);
+    const address = await lucid.wallet.address();
+    const paymentKeyHashHex = Buffer.from(
+      paymentKeyHashBytes(Address.fromBech32(address)),
+    ).toString("hex");
+    const utxos = await lucid.wallet.getUtxos();
+    return {
+      shadows: { address, nfts: shadowNftsFromUtxos(utxos) },
+      native: {
+        address,
+        paymentKeyHashHex,
+        nfts: nativeNftsFromUtxos(utxos),
+      },
+    };
+  });
 }

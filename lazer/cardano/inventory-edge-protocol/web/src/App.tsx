@@ -41,6 +41,7 @@ type VaultRow = {
   outputIndex: string;
   lovelace: string;
   datum: {
+    ownerKeyHashHex?: string;
     debtLovelace: string;
     collateralQty: string;
     feedId: string;
@@ -80,6 +81,8 @@ type NativeNft = {
   nameUtf8?: string;
   quantity: string;
   unit: string;
+  /** Si falta (API vieja), se usa quantity agregada === 1. */
+  hasSingletonUtxo?: boolean;
   suggestedFeedId?: number;
 };
 
@@ -114,6 +117,8 @@ type AuditEvent = {
 };
 
 type MockPoolState = {
+  /** Suma lovelace en UTxOs del script pool (tu owner). */
+  poolScriptTotalLovelace?: string;
   availableLovelace: string;
   encumberedLovelace: string;
   deployedToLoansLovelace: string;
@@ -181,6 +186,11 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
         ? `efectivo cobertura ${errBody.effectiveAvailableLovelace}`
         : "",
     ].filter(Boolean);
+    if (errBody.code === "API_UNAVAILABLE") {
+      bits.push(
+        "Tip: en `inventory-edge-protocol` ejecutá `npm run dev` (sube API :8787 y Vite juntos).",
+      );
+    }
     throw new Error(bits.join(" · "));
   }
   return parsed as T;
@@ -191,18 +201,150 @@ function shortTx(h?: string, n = 14): string {
   return h.length <= n ? h : `${h.slice(0, n)}…`;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function normalizeUnitKey(unit: string): string {
+  return unit.replace(/\s/g, "").toLowerCase();
+}
+
+/** Unit agregada (policy + name hex), misma clave que `nativeNfts[].unit`. */
+function normalizedNftUnit(policyId: string, nameHex: string): string {
+  return normalizeUnitKey(policyId + nameHex);
+}
+
+type WalletApiPayload = {
+  address: string;
+  lucidAddress?: string;
+  paymentKeyHashHex?: string;
+  lovelace: string;
+  adaApprox: string;
+  nftCount: number;
+  nativeNfts?: NativeNft[];
+  shadowNfts: ShadowNft[];
+  /** Si Lucid falló pero Evolution respondió (mint/listado pueden fallar aparte). */
+  lucidError?: string;
+};
+
+type WalletState = {
+  address: string;
+  lucidAddress?: string;
+  paymentKeyHashHex?: string;
+  lovelace: string;
+  adaApprox: string;
+  nftCount: number;
+  nativeNfts: NativeNft[];
+  shadowNfts: ShadowNft[];
+  lucidError?: string;
+};
+
+function mapApiToWalletState(w: WalletApiPayload): WalletState {
+  return {
+    address: w.address,
+    lucidAddress: w.lucidAddress,
+    paymentKeyHashHex: w.paymentKeyHashHex,
+    lovelace: w.lovelace ?? "0",
+    adaApprox: w.adaApprox,
+    nftCount: w.nftCount,
+    nativeNfts: w.nativeNfts ?? [],
+    shadowNfts: w.shadowNfts ?? [],
+    lucidError: w.lucidError,
+  };
+}
+
+/** API actualiza filas; conserva filas que el indexador aún no devuelve (p. ej. recién minteadas). */
+function mergeWalletFromApi(prev: WalletState, w: WalletApiPayload): WalletState {
+  const fromApiNative = w.nativeNfts ?? [];
+  const fromApiShadow = w.shadowNfts ?? [];
+  const nativeMap = new Map<string, NativeNft>();
+  for (const n of prev.nativeNfts) {
+    nativeMap.set(normalizeUnitKey(n.unit), n);
+  }
+  for (const n of fromApiNative) {
+    nativeMap.set(normalizeUnitKey(n.unit), n);
+  }
+  const shadowMap = new Map<string, ShadowNft>();
+  for (const s of prev.shadowNfts) {
+    shadowMap.set(normalizeUnitKey(s.unit), s);
+  }
+  for (const s of fromApiShadow) {
+    shadowMap.set(normalizeUnitKey(s.unit), s);
+  }
+  const nativeNfts = sortNativeNftList([...nativeMap.values()]);
+  const shadowNfts = [...shadowMap.values()].sort((a, b) =>
+    a.nameUtf8.localeCompare(b.nameUtf8),
+  );
+  return {
+    address: w.address,
+    lucidAddress: w.lucidAddress,
+    paymentKeyHashHex: w.paymentKeyHashHex ?? prev.paymentKeyHashHex,
+    lovelace: w.lovelace ?? "0",
+    adaApprox: w.adaApprox,
+    nftCount: w.nftCount,
+    nativeNfts,
+    shadowNfts,
+    lucidError: w.lucidError,
+  };
+}
+
+function sortNativeNftList(nfts: NativeNft[]): NativeNft[] {
+  return [...nfts].sort((a, b) => {
+    if (a.hasSingletonUtxo !== b.hasSingletonUtxo) {
+      return a.hasSingletonUtxo ? -1 : 1;
+    }
+    try {
+      const qa = BigInt(a.quantity);
+      const qb = BigInt(b.quantity);
+      if (qa === 1n && qb !== 1n) return -1;
+      if (qb === 1n && qa !== 1n) return 1;
+    } catch {
+      /* ignore */
+    }
+    return (a.nameUtf8 ?? a.unit).localeCompare(b.nameUtf8 ?? b.unit);
+  });
+}
+
+function applyMintOptimisticToWallet(prev: WalletState, out: MintOut): WalletState {
+  const policyId = out.policyId.replace(/\s/g, "").toLowerCase();
+  const nameHex = out.nameHex.replace(/\s/g, "").toLowerCase();
+  const unit = policyId + nameHex;
+  const native: NativeNft = {
+    policyId,
+    nameHex,
+    nameUtf8: out.assetName,
+    quantity: "1",
+    unit,
+    hasSingletonUtxo: true,
+    suggestedFeedId: out.feedId,
+  };
+  const shadow: ShadowNft = {
+    policyId,
+    nameHex,
+    nameUtf8: out.assetName,
+    unit,
+    feedId: out.feedId,
+    utxoLovelace: "0",
+  };
+  return {
+    ...prev,
+    lucidError: undefined,
+    nativeNfts: [
+      native,
+      ...prev.nativeNfts.filter((n) => normalizeUnitKey(n.unit) !== unit),
+    ],
+    shadowNfts: [
+      shadow,
+      ...prev.shadowNfts.filter((s) => normalizeUnitKey(s.unit) !== unit),
+    ],
+  };
+}
+
 export default function App() {
   const [tab, setTab] = useState<TabId>("general");
   const [health, setHealth] = useState<Health | null>(null);
   const [config, setConfig] = useState<Config | null>(null);
-  const [wallet, setWallet] = useState<{
-    address: string;
-    lucidAddress?: string;
-    adaApprox: string;
-    nftCount: number;
-    nativeNfts: NativeNft[];
-    shadowNfts: ShadowNft[];
-  } | null>(null);
+  const [wallet, setWallet] = useState<WalletState | null>(null);
   const [demoFeeds, setDemoFeeds] = useState<DemoFeedRow[] | null>(null);
   const [vaults, setVaults] = useState<VaultRow[]>([]);
   const [risk, setRisk] = useState<Risk | null>(null);
@@ -228,7 +370,7 @@ export default function App() {
   const [strikeRaw, setStrikeRaw] = useState("2500000");
   const [payoutLovelace, setPayoutLovelace] = useState("5000000");
   const [newDebt, setNewDebt] = useState("0");
-  const [depositLovelace, setDepositLovelace] = useState("10000000");
+  const [onchainPoolLovelace, setOnchainPoolLovelace] = useState("10000000");
 
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(
@@ -254,11 +396,58 @@ export default function App() {
     if (!wallet?.nativeNfts.length) return "";
     const p = nftPolicy.replace(/\s/g, "").toLowerCase();
     const n = nftNameHex.replace(/\s/g, "").toLowerCase();
+    const want = normalizedNftUnit(p, n);
     const hit = wallet.nativeNfts.find(
-      (x) => x.policyId === p && x.nameHex === n,
+      (x) => normalizeUnitKey(x.unit) === want,
     );
     return hit?.unit ?? "";
   }, [wallet?.nativeNfts, nftPolicy, nftNameHex]);
+
+  /**
+   * NFTs que `openVault` puede gastar (al menos un UTxO con qty 1) y que no están
+   * ya en una vault tuya (mismo owner en datum).
+   */
+  const vaultableNativeNfts = useMemo(() => {
+    if (!wallet?.nativeNfts.length) return [];
+    const me = wallet.paymentKeyHashHex?.replace(/\s/g, "").toLowerCase();
+    const inVault = new Set<string>();
+    if (me) {
+      for (const v of vaults) {
+        const ow = v.datum.ownerKeyHashHex?.replace(/\s/g, "").toLowerCase();
+        if (!ow || ow !== me) continue;
+        inVault.add(
+          `${v.datum.nftPolicyHex.replace(/\s/g, "").toLowerCase()}|${v.datum.nftNameHex.replace(/\s/g, "").toLowerCase()}`,
+        );
+      }
+    }
+    return wallet.nativeNfts.filter((n) => {
+      let canOpen: boolean;
+      if (n.hasSingletonUtxo === true) canOpen = true;
+      else if (n.hasSingletonUtxo === false) canOpen = false;
+      else {
+        try {
+          canOpen = BigInt(n.quantity) === 1n;
+        } catch {
+          canOpen = false;
+        }
+      }
+      if (!canOpen) return false;
+      const k = `${n.policyId.toLowerCase()}|${n.nameHex.toLowerCase()}`;
+      return !inVault.has(k);
+    });
+  }, [wallet?.nativeNfts, wallet?.paymentKeyHashHex, vaults]);
+
+  /** Un solo NFT libre: rellenar campos al cargar / refrescar wallet o vaults. */
+  useEffect(() => {
+    if (vaultableNativeNfts.length !== 1) return;
+    const only = vaultableNativeNfts[0]!;
+    setNftPolicy(only.policyId);
+    setNftNameHex(only.nameHex);
+    if (only.suggestedFeedId != null) {
+      setFeedId(String(only.suggestedFeedId));
+    }
+    setOpenVaultCollateralHint(null);
+  }, [vaultableNativeNfts]);
 
   const refreshStatic = useCallback(async () => {
     const [h, c] = await Promise.all([
@@ -269,23 +458,35 @@ export default function App() {
     setConfig(c);
   }, []);
 
-  const refreshWallet = useCallback(async () => {
-    const w = await api<{
-      address: string;
-      lucidAddress?: string;
-      adaApprox: string;
-      nftCount: number;
-      nativeNfts?: NativeNft[];
-      shadowNfts: ShadowNft[];
-    }>("/api/wallet");
-    setWallet({
-      address: w.address,
-      lucidAddress: w.lucidAddress,
-      adaApprox: w.adaApprox,
-      nftCount: w.nftCount,
-      nativeNfts: w.nativeNfts ?? [],
-      shadowNfts: w.shadowNfts ?? [],
-    });
+  const refreshWallet = useCallback(async (): Promise<WalletApiPayload> => {
+    const w = await api<WalletApiPayload>("/api/wallet");
+    setWallet(mapApiToWalletState(w));
+    return w;
+  }, []);
+
+  /**
+   * Sincroniza con Blockfrost/Maestro sin borrar filas optimistas: merge con estado actual.
+   * Corre en background (no bloquea el cartel de mint ni el dropdown).
+   */
+  const reconcileWalletAfterMint = useCallback((out: MintOut) => {
+    const want = normalizedNftUnit(out.policyId, out.nameHex);
+    void (async () => {
+      for (let attempt = 0; attempt < 12; attempt++) {
+        if (attempt > 0) await sleep(2000);
+        try {
+          const w = await api<WalletApiPayload>("/api/wallet");
+          setWallet((prev) =>
+            prev ? mergeWalletFromApi(prev, w) : mapApiToWalletState(w),
+          );
+          const native = w.nativeNfts ?? [];
+          if (native.some((n) => normalizeUnitKey(n.unit) === want)) {
+            return;
+          }
+        } catch {
+          /* seguir */
+        }
+      }
+    })();
   }, []);
 
   const refreshDemoFeeds = useCallback(async () => {
@@ -322,7 +523,7 @@ export default function App() {
   }, []);
 
   const refreshPool = useCallback(async () => {
-    const p = await api<MockPoolState>("/api/mock/pool");
+    const p = await api<MockPoolState>("/api/pool/state");
     setPool(p);
   }, []);
 
@@ -334,7 +535,12 @@ export default function App() {
 
   useEffect(() => {
     if (!health?.hasMnemonic) return;
-    refreshWallet().catch(() => {});
+    refreshWallet().catch((e) =>
+      setMsg({
+        type: "err",
+        text: `No se pudo cargar la wallet (NFTs): ${e instanceof Error ? e.message : String(e)}`,
+      }),
+    );
     refreshVaults().catch(() => {});
   }, [health?.hasMnemonic, refreshWallet, refreshVaults]);
 
@@ -438,7 +644,7 @@ export default function App() {
             [
               "seguros",
               "Cobertura",
-              "Aportar al pool, activar seguro y cobrar si aplica.",
+              "Depositar tADA al pool on-chain, activar seguro y cobrar si aplica.",
             ],
           ] as const
         ).map(([id, label, hint]) => (
@@ -460,12 +666,47 @@ export default function App() {
         <h1>Inventory-Edge Protocol</h1>
         <p>
           Demo para entender el flujo sin ser experto en crypto:{" "}
-          <strong>pool</strong> (liquidez de prueba), <strong>cajas fuertes</strong>{" "}
+          <strong>pool on-chain</strong> (script <code className="mono">liquidity_pool</code>
+          ), <strong>cajas fuertes</strong>{" "}
           (contrato que guarda tu NFT y los números del préstamo), y{" "}
           <strong>precios Pyth</strong> para riesgo y liquidación. Los datos
           técnicos siguen disponibles en cada sección.
         </p>
       </header>
+
+      {(busy || msg) && (
+        <div
+          className="card"
+          style={{
+            marginBottom: "1rem",
+            padding: "0.65rem 1rem",
+            borderStyle: "solid",
+            borderWidth: 1,
+            borderColor:
+              msg?.type === "err"
+                ? "var(--err-border, #c44)"
+                : "var(--accent-muted, rgba(100,180,255,0.35))",
+          }}
+          role="status"
+          aria-live="polite"
+        >
+          {busy && (
+            <p style={{ margin: "0 0 0.35rem", color: "var(--accent)" }}>
+              Ejecutando: <strong>{busy}</strong>…
+            </p>
+          )}
+          {msg?.type === "err" && (
+            <p className="err" style={{ margin: 0 }}>
+              {msg.text}
+            </p>
+          )}
+          {msg?.type === "ok" && (
+            <p className="ok-msg" style={{ margin: 0 }}>
+              {msg.text}
+            </p>
+          )}
+        </div>
+      )}
 
       {tab === "general" && (
         <>
@@ -665,6 +906,11 @@ export default function App() {
                     <strong>{wallet.nativeNfts.length}</strong> activos Lucid
                     (incl. shadow)
                   </p>
+                  {wallet.lucidError && (
+                    <p className="err" style={{ fontSize: "0.85rem" }}>
+                      Lucid (mint / listado NFT): {wallet.lucidError}
+                    </p>
+                  )}
                   <button
                     type="button"
                     onClick={() =>
@@ -763,16 +1009,25 @@ export default function App() {
           </div>
 
           <div className="card" style={{ marginBottom: "1rem" }}>
-            <h2>Pool de liquidez (mock)</h2>
+            <h2>Pool (solo blockchain)</h2>
             <p style={{ fontSize: "0.85rem" }}>
-              Financia préstamos (principal en el datum), reserva coberturas y
-              acumula ganancias demo (intereses de amortización, fee de seguros,
-              excedente simulado al liquidar colateral). Depósitos en Cobertura.
+              Totales leídos en vivo: script{" "}
+              <code className="mono">liquidity_pool</code> + datums de tus vaults
+              (deuda y <code className="mono">hedge</code>). Las filas de
+              “histórico / ganancias” no se persisten (siempre 0) — no valen txs
+              extra solo para métricas.
             </p>
             {!pool ? (
               <p>—</p>
             ) : (
               <ul className="compact">
+                {pool.poolScriptTotalLovelace != null && (
+                  <li>
+                    Total en script pool:{" "}
+                    <span className="mono">{pool.poolScriptTotalLovelace}</span>{" "}
+                    lovelace
+                  </li>
+                )}
                 <li>
                   Disponible: <span className="mono">{pool.availableLovelace}</span>{" "}
                   lovelace
@@ -886,7 +1141,7 @@ export default function App() {
             <p style={{ fontSize: "0.88rem" }}>
               El <strong>vault</strong> custodia el NFT colateral. El{" "}
               <strong>principal</strong> del préstamo sale del{" "}
-              <strong>pool mock</strong> (no se “imprime” deuda). Si el colateral
+              <strong>pool on-chain</strong> (no se “imprime” deuda). Si el colateral
               no cubre principal + margen on-chain (~110%), podés{" "}
               <strong>liquidar</strong> (venta simulada → ingreso al pool). El
               <strong> interés demo</strong> se acredita al pool al bajar el
@@ -900,7 +1155,9 @@ export default function App() {
               <h2>Acuñar NFT sombra</h2>
               <p>
                 NFT único por feed (oro / WTI / BTC proxy). Sirve de colateral
-                en la vault.
+                en la vault. Requiere Blockfrost o Maestro en <code>.env</code>.
+                Tras acuñar, el listado se actualiza al instante; el indexador
+                puede tardar unos segundos en coincidir con la cadena.
               </p>
               <div className="row" style={{ marginTop: "0.75rem" }}>
                 {(["metal", "oil", "stock"] as const).map((slot) => (
@@ -915,15 +1172,51 @@ export default function App() {
                           method: "POST",
                           body: JSON.stringify({ slot }),
                         });
+                        let wApi: WalletApiPayload;
+                        try {
+                          wApi = await api<WalletApiPayload>("/api/wallet");
+                        } catch (e) {
+                          setWallet((prev) =>
+                            prev
+                              ? applyMintOptimisticToWallet(prev, out)
+                              : prev,
+                          );
+                          setLastMint(out);
+                          setNftPolicy(out.policyId);
+                          setNftNameHex(out.nameHex);
+                          setFeedId(String(out.feedId));
+                          setMsg({
+                            type: "ok",
+                            text: `Mint OK en cadena · ${out.assetName} · ${shortTx(out.txHash, 18)}. No se pudo leer /api/wallet: ${e instanceof Error ? e.message : String(e)}. Probá «Refrescar todo» en Resumen.`,
+                          });
+                          await Promise.all([
+                            refreshVaults(),
+                            refreshAudit(),
+                            refreshPool(),
+                          ]);
+                          reconcileWalletAfterMint(out);
+                          return;
+                        }
+                        setWallet((prev) => {
+                          const base = prev
+                            ? mergeWalletFromApi(prev, wApi)
+                            : mapApiToWalletState(wApi);
+                          return applyMintOptimisticToWallet(base, out);
+                        });
                         setLastMint(out);
                         setNftPolicy(out.policyId);
                         setNftNameHex(out.nameHex);
                         setFeedId(String(out.feedId));
                         setMsg({
                           type: "ok",
-                          text: `Mint OK · ${out.assetName} · tx ${out.txHash}`,
+                          text: `Mint OK · ${out.assetName} · tx ${shortTx(out.txHash, 20)}. Elegí el colateral en «NFT disponible para bloquear» (cada shadow es una línea distinta; podés tener varios del mismo feed).`,
                         });
-                        await afterChainAction();
+                        await Promise.all([
+                          refreshVaults(),
+                          refreshAudit(),
+                          refreshPool(),
+                        ]);
+                        reconcileWalletAfterMint(out);
                       })
                     }
                   >
@@ -936,29 +1229,58 @@ export default function App() {
                 ))}
               </div>
               {lastMint && (
-                <p className="mono" style={{ marginTop: "0.75rem" }}>
-                  {lastMint.assetName} · feed {lastMint.feedId}
-                </p>
+                <div
+                  className="ok-msg"
+                  style={{ marginTop: "0.75rem", fontSize: "0.9rem" }}
+                >
+                  <strong>Último mint:</strong>{" "}
+                  <span className="mono">{lastMint.assetName}</span> · feed{" "}
+                  {lastMint.feedId} ·{" "}
+                  <span className="mono">{shortTx(lastMint.txHash, 22)}</span>
+                </div>
               )}
             </div>
 
             <div className="card">
               <h2>Abrir vault</h2>
               <p>
-                Bloquea el NFT en el script (misma vista de UTxOs que{" "}
-                <strong>Lucid</strong>). Si el principal &gt; 0, el pool debe
-                tener tADA disponible (depositá antes en Seguros).
+                Elegí un NFT de la wallet (vista <strong>Lucid</strong>
+                ): cada sombra que minteaste es un <strong>activo distinto</strong>{" "}
+                (nombre único), así que dos WTI aparecen como{" "}
+                <strong>dos opciones</strong> en el menú. Hace falta al menos un
+                UTxO con exactamente 1 unidad de ese token y que no esté ya en
+                una vault tuya. Si el principal &gt; 0, el pool on-chain necesita
+                tADA (Seguros).
               </p>
-              {wallet && wallet.nativeNfts.length > 0 && (
+              {health?.hasMnemonic && wallet === null && (
+                <p className="field-hint">Cargando NFTs (Lucid)…</p>
+              )}
+              {wallet && vaultableNativeNfts.length > 0 && (
                 <div className="field">
-                  <label htmlFor="nftsel">NFTs en tu wallet</label>
+                  <label htmlFor="nftsel">
+                    NFT para bloquear en la vault (
+                    {vaultableNativeNfts.length}{" "}
+                    {vaultableNativeNfts.length === 1 ? "listo" : "listos"})
+                  </label>
                   <select
                     id="nftsel"
-                    value={nativeSelectValue}
+                    value={
+                      nativeSelectValue ||
+                      (vaultableNativeNfts.length === 1
+                        ? vaultableNativeNfts[0]!.unit
+                        : "")
+                    }
                     onChange={(e) => {
                       const u = e.target.value;
-                      if (!u) return;
-                      const nft = wallet.nativeNfts.find((x) => x.unit === u);
+                      if (!u) {
+                        setNftPolicy("");
+                        setNftNameHex("");
+                        setOpenVaultCollateralHint(null);
+                        return;
+                      }
+                      const nft = wallet.nativeNfts.find(
+                        (x) => normalizeUnitKey(x.unit) === normalizeUnitKey(u),
+                      );
                       if (!nft) return;
                       setNftPolicy(nft.policyId);
                       setNftNameHex(nft.nameHex);
@@ -968,45 +1290,90 @@ export default function App() {
                       setOpenVaultCollateralHint(null);
                     }}
                   >
-                    <option value="">— elegí uno o completá hex abajo —</option>
-                    {wallet.nativeNfts.map((n) => (
+                    {vaultableNativeNfts.length > 1 && (
+                      <option value="">— Elegí un NFT —</option>
+                    )}
+                    {vaultableNativeNfts.map((n) => (
                       <option key={n.unit} value={n.unit}>
-                        {n.nameUtf8 ?? `${n.policyId.slice(0, 8)}…${n.nameHex.slice(0, 6)}…`}{" "}
-                        · qty {n.quantity}
+                        {n.nameUtf8 ??
+                          `${n.policyId.slice(0, 8)}…${n.nameHex.slice(0, 6)}…`}{" "}
                         {n.suggestedFeedId != null
-                          ? ` · feed sugerido ${n.suggestedFeedId}`
+                          ? `· feed ${n.suggestedFeedId}`
                           : ""}
                       </option>
                     ))}
                   </select>
                   <p className="field-hint" style={{ marginTop: "0.35rem" }}>
-                    Incluye shadow y cualquier otro nativo. Los shadow traen feed
-                    Pyth sugerido por nombre.
+                    Hace falta <strong>un UTxO con exactamente 1</strong> de ese
+                    activo (si el total agregado es &gt;1 en varios UTxOs, igual
+                    aparece). Solo se excluyen NFTs ya bloqueados en{" "}
+                    <strong>tus</strong> vaults (mismo owner en datum).
                   </p>
                 </div>
               )}
+              {wallet && wallet.nativeNfts.length > 0 && (
+                <details
+                  className="field"
+                  style={{ marginTop: "0.5rem", fontSize: "0.82rem" }}
+                >
+                  <summary style={{ cursor: "pointer" }}>
+                    Ver los {wallet.nativeNfts.length} nativos Lucid (referencia)
+                  </summary>
+                  <ul className="compact" style={{ marginTop: "0.35rem" }}>
+                    {wallet.nativeNfts.map((n) => (
+                      <li key={n.unit} className="mono">
+                        {n.nameUtf8 ?? `${n.policyId.slice(0, 10)}…`} · qty{" "}
+                        {n.quantity} · singleton UTxO:{" "}
+                        {n.hasSingletonUtxo === true
+                          ? "sí"
+                          : n.hasSingletonUtxo === false
+                            ? "no"
+                            : "?"}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+              {wallet &&
+                wallet.nativeNfts.length > 0 &&
+                vaultableNativeNfts.length === 0 && (
+                  <p className="field-hint">
+                    No hay NFTs listos para abrir vault: ya están en una vault
+                    tuya, o ningún UTxo tiene exactamente 1 unidad de ese
+                    token. Consolidá en un solo UTxO, cerrá una vault, minteá
+                    otro shadow o usá edición manual.
+                  </p>
+                )}
               {wallet && wallet.nativeNfts.length === 0 && (
                 <p className="field-hint">
                   No hay activos nativos en la wallet Lucid. Acuñá un shadow o
                   pulsá &quot;Refrescar wallet&quot; en Resumen.
                 </p>
               )}
-              <div className="field">
-                <label htmlFor="pol">NFT policy (hex)</label>
-                <input
-                  id="pol"
-                  value={nftPolicy}
-                  onChange={(e) => setNftPolicy(e.target.value)}
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="nh">NFT name (hex utf8)</label>
-                <input
-                  id="nh"
-                  value={nftNameHex}
-                  onChange={(e) => setNftNameHex(e.target.value)}
-                />
-              </div>
+              <details
+                className="field"
+                style={{ marginTop: "0.65rem", marginBottom: "0.25rem" }}
+              >
+                <summary style={{ cursor: "pointer", fontSize: "0.9rem" }}>
+                  Edición manual (policy / name hex)
+                </summary>
+                <div className="field" style={{ marginTop: "0.5rem" }}>
+                  <label htmlFor="pol">NFT policy (hex)</label>
+                  <input
+                    id="pol"
+                    value={nftPolicy}
+                    onChange={(e) => setNftPolicy(e.target.value)}
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="nh">NFT name (hex)</label>
+                  <input
+                    id="nh"
+                    value={nftNameHex}
+                    onChange={(e) => setNftNameHex(e.target.value)}
+                  />
+                </div>
+              </details>
               <div className="field">
                 <label htmlFor="fid">Pyth feed id</label>
                 <input
@@ -1127,7 +1494,14 @@ export default function App() {
               <button
                 type="button"
                 className="primary"
-                disabled={!!busy || !health?.hasMnemonic}
+                disabled={
+                  !!busy ||
+                  !health?.hasMnemonic ||
+                  !nftPolicy.trim() ||
+                  !nftNameHex.trim() ||
+                  !feedId.trim() ||
+                  Number.isNaN(Number(feedId))
+                }
                 onClick={() =>
                   run("open", async () => {
                     const { txHash } = await api<{ txHash: string }>(
@@ -1296,80 +1670,58 @@ export default function App() {
 
           <div className="grid grid-2" style={{ marginBottom: "1rem" }}>
             <div className="card">
-              <h2>Aportar al pool (demo)</h2>
+              <h2>Aportar al pool (on-chain)</h2>
               <p style={{ fontSize: "0.82rem" }}>
-                Simula capital del asegurador. Persistido en{" "}
-                <code className="mono">data/mock_insurance_pool.json</code>.
-                <strong> No transfiere ADA en cadena</strong> — solo anota números
-                para el demo del pool.
+                Depósitos al script{" "}
+                <code className="mono">liquidity_pool</code> en PreProd (Lucid).
+                El panel del pool se calcula desde la cadena (sin archivo de
+                balances).
               </p>
               <p className="field-hint">
-                Saldo wallet (proveedor):{" "}
+                Saldo wallet (proveedor / Evolution):{" "}
                 <span className="mono">
                   {wallet?.lovelace ?? "—"} lovelace (~{wallet?.adaApprox ?? "?"}{" "}
                   tADA)
                 </span>
               </p>
               <div className="field">
-                <label htmlFor="dep">Lovelace a sumar al disponible</label>
+                <label htmlFor="dep-onchain">Lovelace a depositar</label>
                 <input
-                  id="dep"
-                  value={depositLovelace}
-                  onChange={(e) => setDepositLovelace(e.target.value)}
+                  id="dep-onchain"
+                  value={onchainPoolLovelace}
+                  onChange={(e) => setOnchainPoolLovelace(e.target.value)}
                 />
               </div>
               <div className="row" style={{ flexWrap: "wrap", gap: "0.5rem" }}>
                 <button
                   type="button"
                   className="primary"
-                  disabled={!!busy}
+                  disabled={
+                    !!busy ||
+                    !health?.hasMnemonic ||
+                    !health?.hasBlockfrostOrMaestro
+                  }
+                  title="Transacción PreProd al script liquidity_pool"
                   onClick={() =>
-                    run("pool-dep", async () => {
-                      await api<MockPoolState>("/api/mock/pool/deposit", {
+                    run("pool-onchain-fixed", async () => {
+                      const j = await api<{
+                        txHash: string;
+                        depositedLovelace: string;
+                      }>("/api/pool/onchain/deposit", {
                         method: "POST",
                         body: JSON.stringify({
-                          lovelace: depositLovelace.trim(),
+                          lovelace: onchainPoolLovelace.trim(),
                         }),
                       });
                       setMsg({
                         type: "ok",
-                        text: "Depósito al pool mock registrado.",
+                        text: `On-chain: ${j.depositedLovelace} lovelace. Tx ${j.txHash}`,
                       });
                       await afterChainAction();
                     })
                   }
                 >
-                  Depositar cantidad fija
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    !!busy ||
-                    !health?.hasMnemonic ||
-                    !wallet?.lovelace ||
-                    wallet.lovelace === "0"
-                  }
-                  title="Registra en el pool el 80% del lovelace que ve la API (sin tx on-chain)"
-                  onClick={() =>
-                    run("pool-80", async () => {
-                      const j = await api<{
-                        depositedLovelace: string;
-                        walletLovelace: string;
-                        percent: number;
-                        note: string;
-                      }>("/api/mock/pool/deposit-wallet-percent", {
-                        method: "POST",
-                        body: JSON.stringify({ percent: 80 }),
-                      });
-                      setMsg({
-                        type: "ok",
-                        text: `Pool mock +${j.depositedLovelace} lovelace (${j.percent}% de ${j.walletLovelace}). ${j.note}`,
-                      });
-                      await afterChainAction();
-                    })
-                  }
-                >
-                  Registrar 80% del saldo en el pool
+                  Depositar cantidad fija (on-chain)
                 </button>
                 <button
                   type="button"
@@ -1493,7 +1845,7 @@ export default function App() {
             <div className="card">
               <h2>Activar / actualizar cobertura</h2>
               <p style={{ fontSize: "0.82rem" }}>
-                Tras la tx, el servidor intenta apartar fondos del pool mock
+                Tras la tx, el servidor intenta apartar fondos del pool (ledger)
                 según el payout indicado (puede quedar shortfall si el pool está
                 vacío).
               </p>
@@ -1506,7 +1858,7 @@ export default function App() {
                 />
               </div>
               <div className="field">
-                <label htmlFor="pay">payout_lovelace (tope mock)</label>
+                <label htmlFor="pay">payout_lovelace (tope reserva)</label>
                 <input
                   id="pay"
                   value={payoutLovelace}
@@ -1641,13 +1993,6 @@ export default function App() {
         </>
       )}
 
-      {busy && (
-        <p style={{ marginTop: "1rem", color: "var(--accent)" }}>
-          Ejecutando: {busy}…
-        </p>
-      )}
-      {msg?.type === "err" && <p className="err">{msg.text}</p>}
-      {msg?.type === "ok" && <p className="ok-msg">{msg.text}</p>}
       </div>
     </div>
   );

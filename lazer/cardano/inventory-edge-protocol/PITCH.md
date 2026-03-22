@@ -37,11 +37,15 @@ The three **shadow** assets (gold / WTI / BTC) map to **Pyth Lazer feed ids** in
 
 ## How to demo (operators)
 
+**Judges:** the scoring surface is the **Aiken vault + blueprint** — see the “For judges” section in [`README.md`](./README.md). The steps below are for live PreProd demos only.
+
 1. `npm run build:onchain`
-2. Set `BLOCKFROST_PROJECT_ID`, `CARDANO_MNEMONIC`, `ACCESS_TOKEN` in `.env` (see `.env.example`).
+2. Set `BLOCKFROST_PROJECT_ID` (or `MAESTRO_API_KEY`), `CARDANO_MNEMONIC`, and `ACCESS_TOKEN` in `.env` (see `.env.example`). Skipping Blockfrost/Maestro usually breaks Evolution’s chain simulation (Koios-only is brittle).
 3. `npm run mock-assets` → copy `SHADOW_POLICY_ID` / `SHADOW_NAME_HEX` for one NFT.
 4. `npm run tx:open-vault` → locks NFT + vault datum at the script.
 5. Optional: `npm run tx:hedge` → sets insurance fields.
 6. `npm run tx:liquidate` → Pyth payload + `Liquidate` when the vault is underwater.
+
+**Beyond the CLI:** `package.json` does not ship scripts for **Close**, **Adjust**, **ClaimInsurance**, or **pool** actions — those are available from the **judge API + Vite UI** via `npm run demo` (same `.env`), which calls into `lib/transactions.ts` / `lib/pool_onchain.ts`.
 
 This is **PreProd-only** MVP code: do not reuse keys or mnemonics from demos on mainnet.

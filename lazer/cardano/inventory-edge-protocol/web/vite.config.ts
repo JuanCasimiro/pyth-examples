@@ -27,7 +27,7 @@ export default defineConfig({
               r.end(
                 JSON.stringify({
                   error:
-                    "No hay API en :8787. En otra terminal: npm run dev:api o npm run demo.",
+                    "No hay API en :8787. Desde la carpeta del proyecto: npm run dev (recomendado), npm run demo, o en otra terminal npm run dev:api.",
                   code: "API_UNAVAILABLE",
                 }),
               );

@@ -18,8 +18,14 @@ function requireEnv(name: string): string {
   return v;
 }
 
-/** Shared Lucid instance (Blockfrost/Maestro) — same UTxO view as mint. */
-export async function newLucidPreprod(): Promise<Lucid> {
+/**
+ * CML WASM is not safe with overlapping use: another request must not call
+ * `Lucid.new` / wallet / tx while this one is still using an instance.
+ * Queue the whole create + callback (not only `Lucid.new`).
+ */
+let lucidOpQueue: Promise<unknown> = Promise.resolve();
+
+async function createLucidPreprod(): Promise<Lucid> {
   const projectId = process.env.BLOCKFROST_PROJECT_ID;
   const maestroKey = process.env.MAESTRO_API_KEY;
   if (projectId) {
@@ -37,6 +43,42 @@ export async function newLucidPreprod(): Promise<Lucid> {
   throw new Error("Set BLOCKFROST_PROJECT_ID or MAESTRO_API_KEY (Preprod)");
 }
 
+function rethrowIfLucidWasmPanic(e: unknown): never {
+  const msg = e instanceof Error ? e.message : String(e);
+  const low = msg.toLowerCase();
+  if (
+    low.includes("unreachable") ||
+    low.includes("recursive use") ||
+    low.includes("unsafe aliasing")
+  ) {
+    throw new Error(
+      "Lucid/CML (WASM) falló en runtime. Suele deberse a Node 24+ inestable con lucid-cardano, " +
+        "o a carga muy paralela. Probá Node 20 o 22 LTS (`nvm use 22`), reiniciá `npm run demo` y una sola pestaña. " +
+        `Original: ${msg}`,
+    );
+  }
+  throw e;
+}
+
+/** Run Lucid work (mint, UTxO scan, openVault, …) one request at a time. */
+export async function withLucidPreprod<T>(
+  fn: (lucid: Lucid) => Promise<T>,
+): Promise<T> {
+  const job = lucidOpQueue.then(async () => {
+    const lucid = await createLucidPreprod();
+    try {
+      return await fn(lucid);
+    } catch (e) {
+      rethrowIfLucidWasmPanic(e);
+    }
+  });
+  lucidOpQueue = job.then(
+    () => undefined,
+    () => undefined,
+  );
+  return job;
+}
+
 export type MintShadowResult = {
   txHash: string;
   policyId: string;
@@ -49,55 +91,56 @@ export type MintShadowResult = {
 
 export async function mintShadowNft(slot: DemoSlot): Promise<MintShadowResult> {
   const mnemonic = requireEnv("CARDANO_MNEMONIC");
-  const lucid = await newLucidPreprod();
-  lucid.selectWalletFromSeed(mnemonic);
+  return withLucidPreprod(async (lucid) => {
+    lucid.selectWalletFromSeed(mnemonic);
 
-  const addr = await lucid.wallet.address();
-  const details = lucid.utils.getAddressDetails(addr);
-  if (details.paymentCredential?.type !== "Key") {
-    throw new Error("Expected key payment credential");
-  }
+    const addr = await lucid.wallet.address();
+    const details = lucid.utils.getAddressDetails(addr);
+    if (details.paymentCredential?.type !== "Key") {
+      throw new Error("Expected key payment credential");
+    }
 
-  const key = DEMO_SLOT_TO_KEY[slot];
-  const suffix = randomBytes(4).toString("hex");
-  const assetName = `Shadow${key}_${suffix}`;
-  const nameHex = Buffer.from(assetName, "utf8").toString("hex");
+    const key = DEMO_SLOT_TO_KEY[slot];
+    const suffix = randomBytes(4).toString("hex");
+    const assetName = `Shadow${key}_${suffix}`;
+    const nameHex = Buffer.from(assetName, "utf8").toString("hex");
 
-  const mintingPolicy = lucid.utils.nativeScriptFromJson({
-    type: "all",
-    scripts: [{ type: "sig", keyHash: details.paymentCredential.hash }],
-  });
-  const policyId = lucid.utils.mintingPolicyToId(mintingPolicy);
-  const unit = policyId + nameHex;
+    const mintingPolicy = lucid.utils.nativeScriptFromJson({
+      type: "all",
+      scripts: [{ type: "sig", keyHash: details.paymentCredential.hash }],
+    });
+    const policyId = lucid.utils.mintingPolicyToId(mintingPolicy);
+    const unit = policyId + nameHex;
 
-  const meta = SHADOW_ASSETS[key];
-  const tx = await lucid
-    .newTx()
-    .mintAssets({ [unit]: 1n })
-    .attachMintingPolicy(mintingPolicy)
-    .attachMetadata(721, {
-      [policyId]: {
-        [assetName]: {
-          name: meta.label,
-          description: meta.description,
-          pyth_lazer_feed_id: String(PYTH_LAZER_FEEDS[key]),
-          inventory_edge_class: key,
-          inventory_edge_slot: slot,
+    const meta = SHADOW_ASSETS[key];
+    const tx = await lucid
+      .newTx()
+      .mintAssets({ [unit]: 1n })
+      .attachMintingPolicy(mintingPolicy)
+      .attachMetadata(721, {
+        [policyId]: {
+          [assetName]: {
+            name: meta.label,
+            description: meta.description,
+            pyth_lazer_feed_id: String(PYTH_LAZER_FEEDS[key]),
+            inventory_edge_class: key,
+            inventory_edge_slot: slot,
+          },
         },
-      },
-    })
-    .complete();
+      })
+      .complete();
 
-  const signed = await tx.sign().complete();
-  const txHash = await signed.submit();
+    const signed = await tx.sign().complete();
+    const txHash = await signed.submit();
 
-  return {
-    txHash,
-    policyId,
-    assetName,
-    nameHex,
-    slot,
-    assetKey: key,
-    feedId: PYTH_LAZER_FEEDS[key],
-  };
+    return {
+      txHash,
+      policyId,
+      assetName,
+      nameHex,
+      slot,
+      assetKey: key,
+      feedId: PYTH_LAZER_FEEDS[key],
+    };
+  });
 }
